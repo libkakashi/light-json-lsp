@@ -1,11 +1,10 @@
 /// LSP server: wires all features together via lsp-server.
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use lsp_server::{Connection, ExtractError, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{self, Notification as _};
 use lsp_types::request::{self, Request as _};
@@ -31,14 +30,11 @@ pub struct ServerState {
     pub schemas: SchemaStore,
 }
 
-/// Debounce delay for validation after edits.
-const DEBOUNCE_MS: u64 = 75;
-
-/// Shared state that background threads (debounced validation) can access.
+/// Shared state that the validation worker thread can access.
 struct Shared {
     state: RwLock<ServerState>,
     regex_cache: Mutex<RegexCache>,
-    debounce_versions: Mutex<HashMap<Uri, u64>>,
+    validate_tx: Sender<Uri>,
 }
 
 pub struct JsonLanguageServer {
@@ -48,17 +44,27 @@ pub struct JsonLanguageServer {
 
 impl JsonLanguageServer {
     pub fn new(connection: Connection) -> Self {
-        JsonLanguageServer {
-            connection,
-            shared: Arc::new(Shared {
-                state: RwLock::new(ServerState {
-                    documents: DocumentStore::new(),
-                    schemas: SchemaStore::new(),
-                }),
-                regex_cache: Mutex::new(RegexCache::new()),
-                debounce_versions: Mutex::new(HashMap::new()),
+        let (validate_tx, validate_rx) = crossbeam_channel::unbounded::<Uri>();
+        let shared = Arc::new(Shared {
+            state: RwLock::new(ServerState {
+                documents: DocumentStore::new(),
+                schemas: SchemaStore::new(),
             }),
+            regex_cache: Mutex::new(RegexCache::new()),
+            validate_tx,
+        });
+
+        // Spawn a single long-lived validation worker thread.
+        {
+            let shared = Arc::clone(&shared);
+            let sender = connection.sender.clone();
+            std::thread::Builder::new()
+                .name("validator".into())
+                .spawn(move || validation_worker(validate_rx, shared, sender))
+                .expect("failed to spawn validation worker");
         }
+
+        JsonLanguageServer { connection, shared }
     }
 
     /// Run the server: initialize, then enter the main loop.
@@ -315,32 +321,9 @@ impl JsonLanguageServer {
         }
     }
 
-    /// Schedule a debounced validation on a background thread.
-    fn debounced_validate(&self, uri: Uri) {
-        let version = {
-            let mut versions = self.shared.debounce_versions.lock();
-            let v = versions.entry(uri.clone()).or_insert(0);
-            *v += 1;
-            *v
-        };
-
-        let sender = self.connection.sender.clone();
-        let shared = Arc::clone(&self.shared);
-
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(DEBOUNCE_MS));
-
-            // Check if a newer edit superseded this one.
-            let current = {
-                let versions = shared.debounce_versions.lock();
-                versions.get(&uri).copied().unwrap_or(0)
-            };
-            if current != version {
-                return;
-            }
-
-            validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
-        });
+    /// Schedule validation on the worker thread.
+    fn schedule_validate(&self, uri: Uri) {
+        self.shared.validate_tx.send(uri).ok();
     }
 
     // -----------------------------------------------------------------------
@@ -358,13 +341,7 @@ impl JsonLanguageServer {
                 params.text_document.version,
             );
         }
-        // Run validation (including schema fetch) on a background thread
-        // so the main loop stays responsive during HTTP fetches.
-        let sender = self.connection.sender.clone();
-        let shared = Arc::clone(&self.shared);
-        std::thread::spawn(move || {
-            validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
-        });
+        self.schedule_validate(uri);
     }
 
     fn on_did_change(&self, params: DidChangeTextDocumentParams) {
@@ -385,17 +362,13 @@ impl JsonLanguageServer {
                 }
             }
         }
-        self.debounced_validate(uri);
+        self.schedule_validate(uri);
     }
 
     fn on_did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         debug!("did_save: {}", uri.as_str());
-        let sender = self.connection.sender.clone();
-        let shared = Arc::clone(&self.shared);
-        std::thread::spawn(move || {
-            validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
-        });
+        self.schedule_validate(uri);
     }
 
     fn on_did_close(&self, params: DidCloseTextDocumentParams) {
@@ -714,7 +687,24 @@ impl JsonLanguageServer {
 }
 
 // ---------------------------------------------------------------------------
-// Free function for validation (callable from background threads)
+// Single validation worker thread
+// ---------------------------------------------------------------------------
+
+/// Long-lived worker that processes validation requests sequentially.
+/// When a request arrives, all queued requests are drained and only the
+/// last URI is validated — the worker being busy is the natural throttle.
+fn validation_worker(rx: Receiver<Uri>, shared: Arc<Shared>, sender: Sender<Message>) {
+    while let Ok(mut uri) = rx.recv() {
+        // Drain any queued requests, keeping only the latest URI.
+        while let Ok(newer) = rx.try_recv() {
+            uri = newer;
+        }
+        validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free function for validation
 // ---------------------------------------------------------------------------
 
 fn validate_and_publish(
