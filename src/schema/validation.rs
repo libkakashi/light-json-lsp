@@ -120,8 +120,11 @@ fn validate_node_inner(
 
     // -- enum --
     if !schema.enum_values.is_empty() {
-        let node_val = node_to_json_value(node, source);
-        if !schema.enum_values.iter().any(|e| e == &node_val) {
+        if !schema
+            .enum_values
+            .iter()
+            .any(|e| node_matches_json_value(node, source, e))
+        {
             let allowed: Vec<String> = schema.enum_values.iter().map(|v| format!("{v}")).collect();
             errors.push(err(
                 node,
@@ -135,8 +138,7 @@ fn validate_node_inner(
 
     // -- const --
     if let Some(ref const_val) = schema.const_value {
-        let node_val = node_to_json_value(node, source);
-        if const_val != &node_val {
+        if !node_matches_json_value(node, source, const_val) {
             errors.push(err(node, format!("Value must be {const_val}.")));
         }
     }
@@ -634,12 +636,11 @@ fn validate_array(
         errors.push(err(node, format!("Array has more than {max} items.")));
     }
 
-    // Unique items — use serialized form as hash key for O(n) detection.
+    // Unique items — use raw source text as hash key for O(n) detection.
     if schema.unique_items && items.len() > 1 {
         let mut seen = HashSet::new();
         for item in &items {
-            let val = node_to_json_value(*item, source);
-            let key = serde_json::to_string(&val).unwrap_or_default();
+            let key = item.utf8_text(source).unwrap_or("");
             if !seen.insert(key) {
                 errors.push(err(*item, "Duplicate array item.".into()));
             }
@@ -1376,45 +1377,58 @@ fn node_to_schema_type(node: Node<'_>, source: &[u8]) -> SchemaType {
     }
 }
 
-/// Convert a tree-sitter node to a serde_json::Value for comparison.
-/// Only used for enum/const/uniqueItems checks.
-fn node_to_json_value(node: Node<'_>, source: &[u8]) -> serde_json::Value {
-    match node.kind() {
-        kinds::STRING => {
-            let val = tree::string_value(node, source).unwrap_or_default();
-            serde_json::Value::String(val)
+/// Compare a tree-sitter node directly against a serde_json::Value without
+/// allocating intermediate Value objects. Used for enum/const checks.
+fn node_matches_json_value(node: Node<'_>, source: &[u8], expected: &serde_json::Value) -> bool {
+    match (node.kind(), expected) {
+        (kinds::STRING, serde_json::Value::String(s)) => {
+            tree::string_value(node, source).as_deref() == Some(s.as_str())
         }
-        kinds::NUMBER => {
-            let text = node.utf8_text(source).unwrap_or("0");
-            if let Ok(n) = text.parse::<serde_json::Number>() {
-                serde_json::Value::Number(n)
+        (kinds::NUMBER, serde_json::Value::Number(n)) => {
+            let text = match node.utf8_text(source) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            if let Some(expected_u) = n.as_u64() {
+                text.parse::<u64>().ok() == Some(expected_u)
+            } else if let Some(expected_i) = n.as_i64() {
+                text.parse::<i64>().ok() == Some(expected_i)
+            } else if let Some(expected_f) = n.as_f64() {
+                text.parse::<f64>().ok() == Some(expected_f)
             } else {
-                serde_json::Value::Null
+                false
             }
         }
-        kinds::TRUE => serde_json::Value::Bool(true),
-        kinds::FALSE => serde_json::Value::Bool(false),
-        kinds::NULL => serde_json::Value::Null,
-        kinds::OBJECT => {
-            let mut map = serde_json::Map::new();
+        (kinds::TRUE, serde_json::Value::Bool(true)) => true,
+        (kinds::FALSE, serde_json::Value::Bool(false)) => true,
+        (kinds::NULL, serde_json::Value::Null) => true,
+        (kinds::OBJECT, serde_json::Value::Object(expected_map)) => {
             let mut cursor = node.walk();
-            for pair in tree::object_pairs(node, &mut cursor) {
-                if let Some(key) = tree::pair_key_unescaped(pair, source)
-                    && let Some(val_node) = tree::pair_value(pair)
-                {
-                    map.insert(key, node_to_json_value(val_node, source));
-                }
+            let pairs = tree::object_pairs(node, &mut cursor);
+            if pairs.len() != expected_map.len() {
+                return false;
             }
-            serde_json::Value::Object(map)
+            pairs.iter().all(|pair| {
+                tree::pair_key_unescaped(*pair, source)
+                    .and_then(|key| {
+                        let val_node = tree::pair_value(*pair)?;
+                        let expected_val = expected_map.get(&key)?;
+                        Some(node_matches_json_value(val_node, source, expected_val))
+                    })
+                    .unwrap_or(false)
+            })
         }
-        kinds::ARRAY => {
+        (kinds::ARRAY, serde_json::Value::Array(expected_items)) => {
             let mut cursor = node.walk();
-            let items: Vec<serde_json::Value> = tree::array_items(node, &mut cursor)
+            let items: Vec<_> = tree::array_items(node, &mut cursor);
+            if items.len() != expected_items.len() {
+                return false;
+            }
+            items
                 .iter()
-                .map(|n| node_to_json_value(*n, source))
-                .collect();
-            serde_json::Value::Array(items)
+                .zip(expected_items.iter())
+                .all(|(n, e)| node_matches_json_value(*n, source, e))
         }
-        _ => serde_json::Value::Null,
+        _ => false,
     }
 }

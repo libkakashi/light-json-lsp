@@ -700,6 +700,7 @@ fn validation_worker(rx: Receiver<Uri>, shared: Arc<Shared>, sender: Sender<Mess
             uri = newer;
         }
         validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
