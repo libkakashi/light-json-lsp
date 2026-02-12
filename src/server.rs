@@ -526,14 +526,16 @@ impl JsonLanguageServer {
 
     fn on_document_symbol(&self, id: RequestId, params: DocumentSymbolParams) {
         let uri = &params.text_document.uri;
-        let symbols = {
-            let state = self.shared.state.lock().unwrap();
-            match state.documents.get(uri) {
-                Some(d) => d.symbols(),
-                None => return self.send_response(id, Option::<DocumentSymbolResponse>::None),
-            }
+        let state = self.shared.state.lock().unwrap();
+        let doc = match state.documents.get(uri) {
+            Some(d) => d,
+            None => return self.send_response(id, Option::<DocumentSymbolResponse>::None),
         };
-        let msg = Response::preserialized_ok(id, &symbols);
+        // Write symbols directly into the JSON-RPC envelope buffer —
+        // avoids a second allocation + memcpy of the entire result.
+        let mut buf = Response::start_preserialized(id);
+        crate::symbols::write_document_symbols(doc, &mut buf);
+        let msg = Response::finish_preserialized(buf);
         self.connection.sender.send(msg).ok();
     }
 

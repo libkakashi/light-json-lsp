@@ -275,6 +275,20 @@ impl Response {
             id_json, result_json,
         ))
     }
+
+    /// Start building a pre-serialized response. Returns the envelope prefix
+    /// as a `String` that the caller can append a result body to. After
+    /// appending, call [`Response::finish_preserialized`] to close the envelope.
+    pub fn start_preserialized(id: RequestId) -> String {
+        let id_json = serde_json::to_string(&id).unwrap();
+        format!(r#"{{"jsonrpc":"2.0","id":{},"result":"#, id_json)
+    }
+
+    /// Close a pre-serialized envelope started by [`Response::start_preserialized`].
+    pub fn finish_preserialized(mut buf: String) -> Message {
+        buf.push('}');
+        Message::PreSerialized(buf)
+    }
 }
 
 impl Request {
