@@ -30,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [patch.crates-io]
-lsp-server = { path = "lsp-server" }
+lsp-server = { path = "crates/lsp-server" }
 
 [profile.release]
 opt-level = 3
