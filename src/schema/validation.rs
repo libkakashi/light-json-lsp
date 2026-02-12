@@ -759,6 +759,19 @@ fn validate_array(
 // Composition
 // ---------------------------------------------------------------------------
 
+/// Check whether the node's JSON type could possibly satisfy a sub-schema's
+/// type constraint. Returns `true` (optimistically) when the sub-schema has
+/// no type restriction, so we only reject when we are *certain* of a mismatch.
+fn type_could_match(node: Node<'_>, source: &[u8], sub: &JsonSchema) -> bool {
+    if sub.types.is_empty() {
+        return true;
+    }
+    let node_type = node_to_schema_type(node, source);
+    sub.types
+        .iter()
+        .any(|t| *t == node_type || (*t == SchemaType::Number && node_type == SchemaType::Integer))
+}
+
 fn validate_composition(
     node: Node<'_>,
     source: &[u8],
@@ -773,6 +786,10 @@ fn validate_composition(
 
     if !schema.any_of.is_empty() {
         let any_matches = schema.any_of.iter().any(|sub| {
+            // Fast path: skip full trial validation when the type cannot match.
+            if !type_could_match(node, source, sub) {
+                return false;
+            }
             let mut temp = Vec::new();
             validate_node(node, source, sub, &mut temp, ref_chain, regex_cache);
             temp.is_empty()
@@ -786,15 +803,22 @@ fn validate_composition(
     }
 
     if !schema.one_of.is_empty() {
-        let match_count = schema
-            .one_of
-            .iter()
-            .filter(|sub| {
-                let mut temp = Vec::new();
-                validate_node(node, source, sub, &mut temp, ref_chain, regex_cache);
-                temp.is_empty()
-            })
-            .count();
+        let mut match_count = 0u32;
+        for sub in &schema.one_of {
+            // Fast path: skip full trial validation when the type cannot match.
+            if !type_could_match(node, source, sub) {
+                continue;
+            }
+            let mut temp = Vec::new();
+            validate_node(node, source, sub, &mut temp, ref_chain, regex_cache);
+            if temp.is_empty() {
+                match_count += 1;
+                // Short-circuit: we already know we have too many matches.
+                if match_count > 1 {
+                    break;
+                }
+            }
+        }
         if match_count == 0 {
             errors.push(err(
                 node,
@@ -803,7 +827,7 @@ fn validate_composition(
         } else if match_count > 1 {
             errors.push(err(
                 node,
-                format!("Matches {match_count} schemas but should match exactly one (oneOf)."),
+                format!("Matches {match_count}+ schemas but should match exactly one (oneOf)."),
             ));
         }
     }
