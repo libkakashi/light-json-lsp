@@ -40,12 +40,14 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
-          sudo sed -i 's/^deb http/deb [arch=amd64] http/' /etc/apt/sources.list
-          sudo sed -i 's/^deb-src http/deb-src [arch=amd64] http/' /etc/apt/sources.list
-          CODENAME=$(lsb_release -cs)
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME} main restricted universe" | sudo tee /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-updates main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${CODENAME}-security main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+          # Pin existing ubuntu.sources to amd64 only
+          if grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources; then
+            sudo sed -i 's/^Architectures:.*$/Architectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+          else
+            sudo sed -i 's/^Types: /Architectures: amd64\n&/' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          # Add arm64 sources pointing to ports.ubuntu.com
+          printf 'Types: deb\nURIs: http://ports.ubuntu.com/\nSuites: noble noble-updates noble-security\nComponents: main restricted universe\nArchitectures: arm64\n' | sudo tee /etc/apt/sources.list.d/arm64.sources
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
