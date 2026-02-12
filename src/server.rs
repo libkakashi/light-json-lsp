@@ -292,7 +292,7 @@ impl JsonLanguageServer {
         inline_schema_uri: Option<&str>,
     ) -> Option<Arc<JsonSchema>> {
         let lookup = {
-            let mut state = self.shared.state.write();
+            let state = self.shared.state.read();
             state
                 .schemas
                 .schema_for_document(doc_uri, inline_schema_uri)
@@ -343,16 +343,6 @@ impl JsonLanguageServer {
         });
     }
 
-    /// Run validation immediately and publish diagnostics.
-    fn validate_and_publish(&self, uri: &Uri) {
-        validate_and_publish(
-            uri,
-            &self.shared.state,
-            &self.shared.regex_cache,
-            &self.connection.sender,
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Document sync
     // -----------------------------------------------------------------------
@@ -368,7 +358,13 @@ impl JsonLanguageServer {
                 params.text_document.version,
             );
         }
-        self.validate_and_publish(&uri);
+        // Run validation (including schema fetch) on a background thread
+        // so the main loop stays responsive during HTTP fetches.
+        let sender = self.connection.sender.clone();
+        let shared = Arc::clone(&self.shared);
+        std::thread::spawn(move || {
+            validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
+        });
     }
 
     fn on_did_change(&self, params: DidChangeTextDocumentParams) {
@@ -393,8 +389,13 @@ impl JsonLanguageServer {
     }
 
     fn on_did_save(&self, params: DidSaveTextDocumentParams) {
-        debug!("did_save: {}", params.text_document.uri.as_str());
-        self.validate_and_publish(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        debug!("did_save: {}", uri.as_str());
+        let sender = self.connection.sender.clone();
+        let shared = Arc::clone(&self.shared);
+        std::thread::spawn(move || {
+            validate_and_publish(&uri, &shared.state, &shared.regex_cache, &sender);
+        });
     }
 
     fn on_did_close(&self, params: DidCloseTextDocumentParams) {
@@ -448,6 +449,7 @@ impl JsonLanguageServer {
                 .collect();
 
             let mut state = self.shared.state.write();
+            state.schemas.clear_cache();
             state.schemas.set_associations(associations);
         }
     }
@@ -745,7 +747,7 @@ fn validate_and_publish(
     if needs_schema {
         let schema = {
             let lookup = {
-                let mut state = state.write();
+                let state = state.read();
                 state
                     .schemas
                     .schema_for_document(&uri_str, inline_schema.as_deref())

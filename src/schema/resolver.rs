@@ -1,10 +1,9 @@
 /// Schema resolver: maps document URIs to schemas, fetches remote schemas,
 /// resolves $ref, and caches results.
-use std::num::NonZeroUsize;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use globset::{Glob, GlobMatcher};
-use lru::LruCache;
 use tracing::{debug, warn};
 
 use super::types::JsonSchema;
@@ -19,13 +18,12 @@ pub struct SchemaAssociation {
     pub schema: Option<Arc<JsonSchema>>,
 }
 
-/// Maximum number of cached schemas before eviction.
 const MAX_SCHEMA_CACHE: usize = 32;
 
 /// Manages schema associations, fetching, and caching.
 pub struct SchemaStore {
     associations: Vec<(Vec<GlobMatcher>, String, Option<Arc<JsonSchema>>)>,
-    cache: LruCache<String, Arc<JsonSchema>>,
+    cache: HashMap<String, Arc<JsonSchema>>,
     http: Option<ureq::Agent>,
 }
 
@@ -33,7 +31,7 @@ impl SchemaStore {
     pub fn new() -> Self {
         SchemaStore {
             associations: Vec::new(),
-            cache: LruCache::new(NonZeroUsize::new(MAX_SCHEMA_CACHE).unwrap()),
+            cache: HashMap::new(),
             http: None,
         }
     }
@@ -68,7 +66,7 @@ impl SchemaStore {
     }
 
     pub fn reset_schema(&mut self, uri: &str) {
-        self.cache.pop(uri);
+        self.cache.remove(uri);
     }
 
     pub fn clear_cache(&mut self) {
@@ -76,12 +74,8 @@ impl SchemaStore {
     }
 
     /// Determine the schema URI for a document (sync, no fetching).
-    ///
-    /// Returns either a cached/inline schema directly, or the URI that needs
-    /// to be fetched. The caller is responsible for calling `fetch_and_cache`
-    /// if `SchemaLookup::NeedsFetch` is returned.
     pub fn schema_for_document(
-        &mut self,
+        &self,
         doc_uri: &str,
         inline_schema_uri: Option<&str>,
     ) -> SchemaLookup {
@@ -107,9 +101,11 @@ impl SchemaStore {
         SchemaLookup::None
     }
 
-    /// Insert a fetched schema into the cache. LRU eviction is automatic.
     pub fn insert_cache(&mut self, uri: String, schema: Arc<JsonSchema>) {
-        self.cache.put(uri, schema);
+        if self.cache.len() >= MAX_SCHEMA_CACHE && !self.cache.contains_key(&uri) {
+            self.cache.clear();
+        }
+        self.cache.insert(uri, schema);
     }
 
     fn match_association(&self, doc_uri: &str) -> Option<(String, Option<Arc<JsonSchema>>)> {
@@ -125,7 +121,7 @@ impl SchemaStore {
 
     /// Resolve a `$ref` within a schema.
     pub fn resolve_ref(
-        &mut self,
+        &self,
         reference: &str,
         current_schema: &Arc<JsonSchema>,
         base_uri: &str,

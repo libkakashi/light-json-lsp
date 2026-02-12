@@ -22,8 +22,6 @@ ureq = { version = "3", default-features = false, features = ["json", "native-tl
 regex = "1"
 globset = "0.4"
 percent-encoding = "2"
-lru = "0.12"
-
 # Concurrency
 parking_lot = "0.12"
 
