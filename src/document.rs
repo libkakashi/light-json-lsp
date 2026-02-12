@@ -249,6 +249,10 @@ impl DocumentStore {
     pub fn get_mut(&mut self, uri: &Uri) -> Option<&mut Document> {
         self.docs.get_mut(uri)
     }
+
+    pub fn uris(&self) -> impl Iterator<Item = &Uri> {
+        self.docs.keys()
+    }
 }
 
 impl Default for DocumentStore {

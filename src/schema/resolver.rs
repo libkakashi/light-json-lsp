@@ -213,7 +213,11 @@ pub fn extract_schema_property(doc: &Document) -> Option<String> {
     }
     let mut cursor = root.walk();
     for pair in tree::object_pairs(root, &mut cursor) {
-        if tree::pair_key(pair, doc.source())? == "$schema" {
+        let key = match tree::pair_key(pair, doc.source()) {
+            Some(k) => k,
+            None => continue, // skip pairs with unparseable keys (e.g. mid-edit)
+        };
+        if key == "$schema" {
             let val = tree::pair_value(pair)?;
             if val.kind() == kinds::STRING {
                 return tree::string_value(val, doc.source());

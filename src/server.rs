@@ -390,6 +390,13 @@ impl JsonLanguageServer {
 
     fn on_did_change_configuration(&self, params: DidChangeConfigurationParams) {
         debug!("did_change_configuration");
+        self.send_notification::<notification::LogMessage>(LogMessageParams {
+            typ: MessageType::LOG,
+            message: format!(
+                "[config] raw settings: {}",
+                serde_json::to_string(&params.settings).unwrap_or_default()
+            ),
+        });
         if let Some(schemas) = params
             .settings
             .as_object()
@@ -424,6 +431,14 @@ impl JsonLanguageServer {
             let mut state = self.shared.state.write();
             state.schemas.clear_cache();
             state.schemas.set_associations(associations);
+
+            // Re-validate all open documents so that files opened before
+            // configuration arrived get schema diagnostics immediately.
+            let uris: Vec<Uri> = state.documents.uris().cloned().collect();
+            drop(state);
+            for uri in uris {
+                self.schedule_validate(uri);
+            }
         }
     }
 
@@ -714,74 +729,114 @@ fn validate_and_publish(
     regex_cache: &Mutex<RegexCache>,
     sender: &Sender<Message>,
 ) {
-    let (mut diags, version, needs_schema, uri_str, inline_schema) = {
-        let state = state.read();
-
-        let doc = match state.documents.get(uri) {
-            Some(d) => d,
-            None => return,
+    // Helper to send a log message to the client.
+    let log = |msg: String| {
+        let params = LogMessageParams {
+            typ: MessageType::LOG,
+            message: msg,
         };
-
-        let diags = diagnostics::syntax_diagnostics(doc);
-        let version = Some(doc.version);
-        let needs_schema = diags.is_empty() && tree::root_value(&doc.tree).is_some();
-        let uri_str = uri.as_str().to_string();
-        let inline_schema = if needs_schema {
-            crate::schema::resolver::extract_schema_property(doc)
-        } else {
-            None
-        };
-
-        (diags, version, needs_schema, uri_str, inline_schema)
+        let not = Notification::new(
+            notification::LogMessage::METHOD.into(),
+            serde_json::to_value(params).unwrap(),
+        );
+        sender.send(Message::Notification(not)).ok();
     };
 
-    if needs_schema {
-        let schema = {
-            let lookup = {
-                let state = state.read();
-                state
-                    .schemas
-                    .schema_for_document(&uri_str, inline_schema.as_deref())
+    // Resolve the schema eagerly — even when the tree has syntax errors.
+    // Schema resolution (especially the initial HTTP fetch) must not be
+    // blocked by transient parse errors, otherwise the first edit that
+    // introduces a syntax error prevents the schema from ever being fetched
+    // until a save produces a clean tree.
+    let schema = {
+        let (uri_str, inline_schema) = {
+            let state = state.read();
+            let doc = match state.documents.get(uri) {
+                Some(d) => d,
+                None => return,
             };
-
-            match lookup {
-                SchemaLookup::Resolved(schema) => Some(schema),
-                SchemaLookup::NeedsFetch(fetch_uri) => {
-                    let agent = state.write().schemas.http_agent();
-                    let raw = resolver::fetch_schema(&agent, &fetch_uri);
-                    raw.map(|r| {
-                        let schema = JsonSchema::from_value(&r);
-                        state
-                            .write()
-                            .schemas
-                            .insert_cache(fetch_uri, schema.clone());
-                        schema
-                    })
-                }
-                SchemaLookup::None => None,
-            }
+            let uri_str = uri.as_str().to_string();
+            let inline_schema = crate::schema::resolver::extract_schema_property(doc);
+            log(format!(
+                "[validate] uri={}, version={}, has_error={}, inline_schema={:?}",
+                uri_str,
+                doc.version,
+                doc.tree.root_node().has_error(),
+                inline_schema,
+            ));
+            (uri_str, inline_schema)
         };
 
-        let state = state.read();
-        let mut regex_cache = regex_cache.lock();
-        if let (Some(schema), Some(doc)) = (schema, state.documents.get(uri))
-            && let Some(root) = tree::root_value(&doc.tree)
-        {
-            let val_errors = validation::validate(root, doc.source(), &schema, &mut regex_cache);
-            for ve in &val_errors {
-                diags.push(lsp_types::Diagnostic {
-                    range: doc.range_of(ve.start_byte, ve.end_byte),
-                    severity: Some(match ve.severity {
-                        validation::Severity::Error => DiagnosticSeverity::ERROR,
-                        validation::Severity::Warning => DiagnosticSeverity::WARNING,
-                    }),
-                    source: Some("json".into()),
-                    message: ve.message.clone(),
-                    ..lsp_types::Diagnostic::default()
-                });
+        let lookup = {
+            let state = state.read();
+            state
+                .schemas
+                .schema_for_document(&uri_str, inline_schema.as_deref())
+        };
+        match lookup {
+            SchemaLookup::Resolved(schema) => {
+                log("[validate] schema=Resolved".into());
+                Some(schema)
+            }
+            SchemaLookup::NeedsFetch(fetch_uri) => {
+                log(format!("[validate] schema=NeedsFetch({})", fetch_uri));
+                let agent = state.write().schemas.http_agent();
+                let raw = resolver::fetch_schema(&agent, &fetch_uri);
+                raw.map(|r| {
+                    let schema = JsonSchema::from_value(&r);
+                    state
+                        .write()
+                        .schemas
+                        .insert_cache(fetch_uri, schema.clone());
+                    schema
+                })
+            }
+            SchemaLookup::None => {
+                log("[validate] schema=None".into());
+                None
+            }
+        }
+    };
+
+    // Now take a single consistent snapshot for all diagnostics.
+    let state = state.read();
+    let doc = match state.documents.get(uri) {
+        Some(d) => d,
+        None => return,
+    };
+
+    let mut diags = diagnostics::syntax_diagnostics(doc);
+    let version = Some(doc.version);
+
+    let has_schema = schema.is_some();
+    if let Some(schema) = schema {
+        if diags.is_empty() {
+            if let Some(root) = tree::root_value(&doc.tree) {
+                let mut regex_cache = regex_cache.lock();
+                let val_errors =
+                    validation::validate(root, doc.source(), &schema, &mut regex_cache);
+                for ve in &val_errors {
+                    diags.push(lsp_types::Diagnostic {
+                        range: doc.range_of(ve.start_byte, ve.end_byte),
+                        severity: Some(match ve.severity {
+                            validation::Severity::Error => DiagnosticSeverity::ERROR,
+                            validation::Severity::Warning => DiagnosticSeverity::WARNING,
+                        }),
+                        source: Some("json".into()),
+                        message: ve.message.clone(),
+                        ..lsp_types::Diagnostic::default()
+                    });
+                }
             }
         }
     }
+    log(format!(
+        "[validate] publishing {} diags, version={:?}, schema={}",
+        diags.len(),
+        version,
+        has_schema,
+    ));
+
+    drop(state);
 
     let params = PublishDiagnosticsParams {
         uri: uri.clone(),
