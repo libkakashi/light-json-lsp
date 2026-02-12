@@ -6,7 +6,7 @@
 /// - Node kind constants
 /// - String unescaping
 /// - Convenient tree-walking helpers
-use tree_sitter::{Node, Parser, Point, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 // ---------------------------------------------------------------------------
 // Node kind constants
@@ -138,29 +138,6 @@ impl Default for JsonParser {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ---------------------------------------------------------------------------
-// InputEdit construction
-// ---------------------------------------------------------------------------
-
-/// Convert a byte offset to a tree-sitter `Point` (row, column in bytes).
-pub fn byte_to_point(source: &str, byte_offset: usize) -> Point {
-    let offset = byte_offset.min(source.len());
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for (i, b) in source.bytes().enumerate() {
-        if i == offset {
-            break;
-        }
-        if b == b'\n' {
-            row += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    Point::new(row, col)
 }
 
 // ---------------------------------------------------------------------------
@@ -641,23 +618,5 @@ mod tests {
             unescape_json_string("plain text"),
             Some("plain text".into())
         );
-    }
-
-    // -- byte_to_point --
-
-    #[test]
-    fn byte_to_point_basic() {
-        let src = "ab\ncd\nef";
-        assert_eq!(byte_to_point(src, 0), Point::new(0, 0));
-        assert_eq!(byte_to_point(src, 2), Point::new(0, 2)); // At \n
-        assert_eq!(byte_to_point(src, 3), Point::new(1, 0)); // Start of line 2
-        assert_eq!(byte_to_point(src, 6), Point::new(2, 0)); // Start of line 3
-    }
-
-    #[test]
-    fn byte_to_point_past_end() {
-        let src = "abc";
-        let p = byte_to_point(src, 100);
-        assert_eq!(p, Point::new(0, 3));
     }
 }

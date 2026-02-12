@@ -11,7 +11,14 @@ use line_index::{LineCol, LineIndex, WideEncoding, WideLineCol};
 use lsp_types::{Position, Range, Uri};
 use tree_sitter::Tree;
 
-use crate::tree::{self, FieldIds, JsonParser, KindIds};
+use crate::tree::{FieldIds, JsonParser, KindIds};
+
+/// Convert a byte offset to a tree-sitter `Point` using a `LineIndex` (O(log n)).
+#[inline]
+fn byte_to_point(index: &LineIndex, offset: usize) -> tree_sitter::Point {
+    let lc = index.line_col(line_index::TextSize::new(offset as u32));
+    tree_sitter::Point::new(lc.line as usize, lc.col as usize)
+}
 
 // ---------------------------------------------------------------------------
 // Helpers: line-index <-> LSP type conversion
@@ -98,15 +105,16 @@ impl Document {
         let old_end_byte = self.offset_of(range.end);
         let new_end_byte = start_byte + new_text.len();
 
-        // Compute old positions from the current (pre-edit) source.
-        let start_position = tree::byte_to_point(&self.text, start_byte);
-        let old_end_position = tree::byte_to_point(&self.text, old_end_byte);
+        // Compute old positions from the current (pre-edit) line index (O(log n)).
+        let start_position = byte_to_point(&self.line_index, start_byte);
+        let old_end_position = byte_to_point(&self.line_index, old_end_byte);
 
         // Apply the text change.
         self.text.replace_range(start_byte..old_end_byte, new_text);
 
-        // Compute new_end_position from the updated source.
-        let new_end_position = tree::byte_to_point(&self.text, new_end_byte);
+        // Rebuild the line index from the updated text, then compute new_end_position.
+        self.line_index = LineIndex::new(&self.text);
+        let new_end_position = byte_to_point(&self.line_index, new_end_byte);
 
         let edit = tree_sitter::InputEdit {
             start_byte,
@@ -125,8 +133,6 @@ impl Document {
             .expect("tree-sitter reparse should always succeed");
 
         self.version = version;
-        // Rebuild the line index (SIMD-accelerated, fast enough for incremental edits).
-        self.line_index = LineIndex::new(&self.text);
         self.is_ascii = self.text.is_ascii();
     }
 
