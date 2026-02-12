@@ -30,8 +30,14 @@ fn collect_errors(doc: &Document, node: Node<'_>, diags: &mut Vec<Diagnostic>) {
         if is_trailing_comma_error(node, doc.source()) {
             return;
         }
-        let range = doc.range_of(node.start_byte(), node.end_byte());
-        let message = describe_error(node, doc.source());
+        // Suppress spurious closing bracket ERRORs that are artifacts of a
+        // broken object/array already reported by a sibling ERROR containing
+        // the opening bracket. e.g. `{a: 1}` → ERROR({a:) + 1 + ERROR(}).
+        if is_orphan_close_bracket(node, doc.source()) {
+            return;
+        }
+        let (message, start, end) = describe_error(node, doc.source());
+        let range = doc.range_of(start, end);
         diags.push(Diagnostic {
             range,
             severity: Some(DiagnosticSeverity::ERROR),
@@ -129,14 +135,43 @@ fn is_trailing_comma_missing(node: Node<'_>) -> bool {
         .is_some_and(|p| tree::is_value_node(&p))
 }
 
+/// Detect a closing bracket ERROR (`}` or `]`) that is an artifact of a
+/// broken object/array already reported by a preceding sibling ERROR. When
+/// tree-sitter can't parse `{a: 1}` as an object it produces:
+///   document → ERROR({a:) number(1) ERROR(})
+/// The second ERROR is just noise — the real problem is the unquoted key.
+fn is_orphan_close_bracket(node: Node<'_>, source: &[u8]) -> bool {
+    let text = node_text(node, source);
+    if text != "}" && text != "]" {
+        return false;
+    }
+    // Walk backwards through siblings to find a matching ERROR with the
+    // opening bracket.
+    let open = if text == "}" { "{" } else { "[" };
+    let mut prev = node.prev_sibling();
+    while let Some(sib) = prev {
+        if sib.is_error() {
+            let mut cursor = sib.walk();
+            let has_open = sib.children(&mut cursor).any(|c| c.kind() == open);
+            if has_open {
+                return true;
+            }
+        }
+        prev = sib.prev_sibling();
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Descriptive error messages
 // ---------------------------------------------------------------------------
 
 /// Produce a human-readable message for an ERROR node by inspecting its
-/// children and surrounding context.
-fn describe_error(node: Node<'_>, source: &[u8]) -> String {
+/// children and surrounding context. Returns (message, start_byte, end_byte)
+/// so the caller can build a precise range.
+fn describe_error(node: Node<'_>, source: &[u8]) -> (String, usize, usize) {
     let text = node_text(node, source);
+    let full = (node.start_byte(), node.end_byte());
 
     // Check what children the ERROR node contains.
     let mut cursor = node.walk();
@@ -144,77 +179,188 @@ fn describe_error(node: Node<'_>, source: &[u8]) -> String {
     let child_kinds: Vec<&str> = children.iter().map(|c| c.kind()).collect();
 
     let has_colon = child_kinds.contains(&":");
-    let has_comma = child_kinds.contains(&",");
 
-    // Patterns involving colon — distinguish "missing value" from "missing key".
-    if has_colon {
-        let string_pos = children.iter().position(|c| c.kind() == kinds::STRING);
-        let colon_pos = children.iter().position(|c| c.kind() == ":").unwrap();
-
-        if let Some(sp) = string_pos {
-            if sp < colon_pos {
-                // "key": , or "key": → string before colon means value is missing.
-                return "Expected a value.".into();
-            }
-            // : "value" → string after colon means key is missing.
-            return "Expected a property name.".into();
-        }
-
-        // Colon present but no string at all — check for unquoted/single-quoted key.
-        if let Some(err_child) = children.iter().find(|c| c.is_error()) {
-            let err_text = node_text(*err_child, source);
-            if err_text.starts_with('\'') {
-                return "Single-quoted strings are not allowed in JSON. Use double quotes.".into();
-            }
-        }
-        // Colon with no recognizable key or value.
-        return "Expected a property name before \":\".".into();
-    }
-
-    // ERROR at document root containing "{" or "[" → broken object/array start,
-    // typically unquoted or single-quoted keys like `{a:` or `{'a':`.
-    if (child_kinds.contains(&"{") || child_kinds.contains(&"["))
-        && let Some(err_child) = children.iter().find(|c| c.is_error())
-    {
-        let err_text = node_text(*err_child, source);
-        if err_text.starts_with('\'') {
-            return "Single-quoted strings are not allowed in JSON. Use double quotes.".into();
-        }
-        if err_text
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphabetic() || c == '_')
-        {
-            return format!(
-                "Unexpected token \"{err_text}\". Property keys must be double-quoted."
+    // --- Unclosed string at document root. ---
+    // tree-sitter represents `{"a": "hello}` as a root ERROR with `{`, string,
+    // `:`, `"`, `string_content` children. The lone `"` (without a matching
+    // close) is the giveaway. Check this before the colon branch so we don't
+    // misreport it as "Expected a value".
+    if child_kinds.contains(&"{") || child_kinds.contains(&"[") {
+        if child_kinds.contains(&"\"") {
+            let quote_node = children.iter().find(|c| c.kind() == "\"").unwrap();
+            return (
+                "Unterminated string.".into(),
+                quote_node.start_byte(),
+                node.end_byte(),
             );
         }
     }
 
-    // ERROR containing a pair node → missing comma between properties
-    if child_kinds.contains(&kinds::PAIR) {
-        return "Expected comma before this property.".into();
-    }
+    // --- Patterns involving colon — distinguish "missing value" from "missing key". ---
+    if has_colon {
+        let colon_pos = children.iter().position(|c| c.kind() == ":").unwrap();
+        let colon_node = children[colon_pos];
 
-    // ERROR that is just a closing bracket → extra closing bracket
-    if text == "}" || text == "]" {
-        return format!("Unexpected \"{text}\".");
-    }
-
-    // ERROR with only commas (not trailing — those are filtered earlier)
-    if child_kinds.iter().all(|&k| k == ",") && !child_kinds.is_empty() {
-        if has_comma && child_kinds.len() > 1 {
-            return "Unexpected comma.".into();
+        // Check for unquoted/single-quoted key ERROR child before the colon.
+        // e.g. `{foo: "bar"}` → ERROR(foo) : string("bar")
+        if let Some(err_child) = children[..colon_pos].iter().find(|c| c.is_error()) {
+            let err_text = node_text(*err_child, source);
+            if err_text.starts_with('\'') {
+                return (
+                    "Single-quoted strings are not allowed in JSON. Use double quotes.".into(),
+                    err_child.start_byte(),
+                    err_child.end_byte(),
+                );
+            }
+            if err_text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+            {
+                return (
+                    format!(
+                        "Unexpected token \"{err_text}\". Property keys must be double-quoted."
+                    ),
+                    err_child.start_byte(),
+                    err_child.end_byte(),
+                );
+            }
         }
-        // Single comma in an unexpected position
-        return "Unexpected comma.".into();
+
+        // Check for number as key before colon (e.g. `{1: "value"}`)
+        if let Some(num_node) = children[..colon_pos]
+            .iter()
+            .find(|c| c.kind() == kinds::NUMBER)
+        {
+            let num_text = node_text(*num_node, source);
+            return (
+                format!(
+                    "Unexpected token \"{num_text}\". Property keys must be double-quoted strings."
+                ),
+                num_node.start_byte(),
+                num_node.end_byte(),
+            );
+        }
+
+        let string_pos = children.iter().position(|c| c.kind() == kinds::STRING);
+
+        if let Some(sp) = string_pos {
+            if sp < colon_pos {
+                // "key": , or "key": → string before colon means value is missing.
+                // Point at the position right after the colon.
+                let after_colon = colon_node.end_byte();
+                return ("Expected a value.".into(), after_colon, after_colon);
+            }
+            // : "value" → string after colon means key is missing.
+            // Point at the colon.
+            return (
+                "Expected a property name.".into(),
+                colon_node.start_byte(),
+                colon_node.end_byte(),
+            );
+        }
+
+        // Colon with no recognizable key or value.
+        return (
+            "Expected a property name before \":\".".into(),
+            colon_node.start_byte(),
+            colon_node.end_byte(),
+        );
     }
 
-    // Fallback: show the unexpected text (truncated).
+    // --- ERROR at document root containing "{" or "[" → broken object/array. ---
+    // tree-sitter wraps the whole `{key: ...` as a single ERROR when the key is
+    // unquoted/single-quoted. Narrow the range to the offending child.
+    if child_kinds.contains(&"{") || child_kinds.contains(&"[") {
+        if let Some(err_child) = children.iter().find(|c| c.is_error()) {
+            let err_text = node_text(*err_child, source);
+            if err_text.starts_with('\'') {
+                return (
+                    "Single-quoted strings are not allowed in JSON. Use double quotes.".into(),
+                    err_child.start_byte(),
+                    err_child.end_byte(),
+                );
+            }
+            if err_text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+            {
+                return (
+                    format!(
+                        "Unexpected token \"{err_text}\". Property keys must be double-quoted."
+                    ),
+                    err_child.start_byte(),
+                    err_child.end_byte(),
+                );
+            }
+        }
+    }
+
+    // --- ERROR containing a string + value but no colon → missing colon. ---
+    // e.g. `{"a" 1}` → ERROR children: [string "a", number 1]
+    if children.iter().any(|c| c.kind() == kinds::STRING)
+        && children
+            .iter()
+            .any(|c| tree::is_value_node(c) && c.kind() != kinds::STRING)
+    {
+        let string_node = children.iter().find(|c| c.kind() == kinds::STRING).unwrap();
+        return (
+            "Expected \":\" after property key.".into(),
+            string_node.start_byte(),
+            string_node.end_byte(),
+        );
+    }
+
+    // --- ERROR containing a pair node → missing comma between properties. ---
+    // e.g. `{"a": 1 "b": 2}` → ERROR wraps `"a": 1`.
+    // Point at the next pair (the one missing the preceding comma).
+    if child_kinds.contains(&kinds::PAIR) {
+        if let Some(next) = node.next_sibling() {
+            if next.kind() == kinds::PAIR {
+                return (
+                    "Expected \",\" after value.".into(),
+                    next.start_byte(),
+                    next.start_byte(),
+                );
+            }
+        }
+        return ("Expected \",\" after value.".into(), full.0, full.1);
+    }
+
+    // --- ERROR that is just a closing bracket → extra closing bracket. ---
+    if text == "}" || text == "]" {
+        return (format!("Unexpected \"{text}\"."), full.0, full.1);
+    }
+
+    // --- ERROR with only commas (not trailing — those are filtered earlier). ---
+    // In arrays, a lone comma ERROR between two values is better described as a
+    // missing value: `[1, , 3]`.  tree-sitter parses this as:
+    //   array → [ number(1) ERROR(,) , number(3) ]
+    // So the ERROR's prev_sibling is the value, and next_sibling is the `,`.
+    if child_kinds.iter().all(|&k| k == ",") && !child_kinds.is_empty() {
+        let in_array = node.parent().is_some_and(|p| p.kind() == kinds::ARRAY);
+        let has_prev = node
+            .prev_sibling()
+            .is_some_and(|p| tree::is_value_node(&p) || p.kind() == ",");
+        let has_next = node
+            .next_sibling()
+            .is_some_and(|n| tree::is_value_node(&n) || n.kind() == ",");
+        if in_array && has_prev && has_next {
+            return ("Expected a value.".into(), full.0, full.1);
+        }
+        return ("Unexpected comma.".into(), full.0, full.1);
+    }
+
+    // --- Fallback: show the unexpected text (truncated). ---
     if text.len() <= 20 {
-        format!("Unexpected token \"{text}\".")
+        (format!("Unexpected token \"{text}\"."), full.0, full.1)
     } else {
-        format!("Unexpected token \"{}\"...", &text[..20])
+        (
+            format!("Unexpected token \"{}\"...", &text[..20]),
+            full.0,
+            full.1,
+        )
     }
 }
 
@@ -420,7 +566,7 @@ mod tests {
     #[test]
     fn error_missing_comma_between_properties() {
         let msgs = error_messages(r#"{"a": 1 "b": 2}"#);
-        assert!(msgs.iter().any(|m| m.contains("comma")));
+        assert!(msgs.iter().any(|m| m.contains("\",\"")));
     }
 
     // --- Duplicate keys ---
@@ -474,6 +620,71 @@ mod tests {
             dups.iter()
                 .all(|d| d.severity == Some(DiagnosticSeverity::WARNING))
         );
+    }
+
+    // --- Range precision ---
+
+    #[test]
+    fn unquoted_key_highlights_key_only() {
+        let diags = errors(r#"{a: 1}"#);
+        assert_eq!(diags.len(), 1); // No spurious extra error for `}`
+        assert_eq!(diags[0].range.start.character, 1); // `a` starts at col 1
+        assert_eq!(diags[0].range.end.character, 2); // `a` ends at col 2
+    }
+
+    #[test]
+    fn single_quoted_key_highlights_quotes_only() {
+        let diags = errors(r#"{'a': 1}"#);
+        assert_eq!(diags.len(), 1); // No spurious extra error
+        assert_eq!(diags[0].range.start.character, 1); // `'a'` starts at col 1
+        assert_eq!(diags[0].range.end.character, 4); // `'a'` ends at col 4
+    }
+
+    #[test]
+    fn unquoted_multi_char_key_highlights_key() {
+        let diags = errors(r#"{foo: "bar"}"#);
+        let key_err: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("double-quoted"))
+            .collect();
+        assert_eq!(key_err.len(), 1);
+        assert_eq!(key_err[0].range.start.character, 1); // `foo` at col 1
+        assert_eq!(key_err[0].range.end.character, 4); // `foo` ends at col 4
+    }
+
+    #[test]
+    fn missing_colon_detected() {
+        let msgs = error_messages(r#"{"a" 1}"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("\":\"") || m.contains("colon"))
+        );
+    }
+
+    #[test]
+    fn unterminated_string_detected() {
+        let msgs = error_messages(r#"{"a": "hello}"#);
+        assert!(msgs.iter().any(|m| m.contains("Unterminated string")));
+    }
+
+    #[test]
+    fn number_as_key_detected() {
+        let msgs = error_messages(r#"{1: "value"}"#);
+        assert!(msgs.iter().any(|m| m.contains("double-quoted")));
+    }
+
+    #[test]
+    fn double_comma_in_array_expects_value() {
+        let msgs = error_messages(r#"{"a": [1, , 3]}"#);
+        assert!(msgs.iter().any(|m| m.contains("Expected a value")));
+    }
+
+    #[test]
+    fn missing_comma_points_at_next_property() {
+        let diags = errors(r#"{"a": 1 "b": 2}"#);
+        assert_eq!(diags.len(), 1);
+        // Should point at col 8 where `"b"` starts, not at `"a": 1`
+        assert_eq!(diags[0].range.start.character, 8);
     }
 }
 
